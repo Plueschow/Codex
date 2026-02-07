@@ -25,6 +25,15 @@ class CallbackRegistry:
     def get(self, token: str) -> Optional[CallbackEvent]:
         return self.events.get(token)
 
+    def wait_for(self, token: str, timeout: float) -> Optional[CallbackEvent]:
+        end = time.time() + timeout
+        while time.time() < end:
+            event = self.get(token)
+            if event:
+                return event
+            time.sleep(0.1)
+        return None
+
 
 class _Handler(BaseHTTPRequestHandler):
     registry: CallbackRegistry

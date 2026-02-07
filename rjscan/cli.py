@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -15,8 +16,13 @@ from rjscan.enumerate import enumerate_jmx, enumerate_rmi_registry
 from rjscan.graph import Endpoint, bfs_graph, extract_hints
 from rjscan.kb import load_gadgets
 from rjscan.nmap_parser import parse_nmap_xml, PortInfo
-from rjscan.poc import load_poc_plugin
+from rjscan.poc.verifier_windows import VerifierContext, verify_cmd, verify_file_write
+from rjscan.poc_runner import coerce_runner_result, load_runner
 from rjscan.verify import run_checks
+
+
+DEFAULT_POC_FILE_PATH = r"C:\Pentest_RMI_<DATE>.txt"
+DEFAULT_POC_FILE_TEMPLATE = "Timestamp: {TIMESTAMP}\nwhoami: {WHOAMI}\nhostname: {HOSTNAME}\n"
 
 
 def detect_candidates(host: str, port: PortInfo) -> Optional[Endpoint]:
@@ -93,13 +99,25 @@ def build_findings_markdown(results: List[Dict[str, Any]]) -> str:
         lines.append(f"- Port: {item['port']}")
         lines.append(f"- Kind: {item['kind']}")
         lines.append(f"- Exploitability: {item['exploitability']}")
+        if item.get("poc", {}).get("proofs"):
+            lines.append("")
+            lines.append("### PoC Proof")
+            for proof in item["poc"]["proofs"]:
+                lines.append(f"- Proof Type: {proof['type']}")
+                lines.append(f"- Proof Path: {proof.get('path', 'n/a')}")
+                summary = proof.get("summary") or ""
+                if summary:
+                    lines.append(f"- Proof Summary: {summary}")
+                if proof.get("evidence"):
+                    lines.append("- Evidence:")
+                    for ref in proof["evidence"]:
+                        lines.append(f"  - {ref['path']} ({ref['sha256']})")
         lines.append("")
     return "\n".join(lines)
 
 
-def compute_exploitability(findings: List[Dict[str, Any]]) -> str:
-    poc = next((finding for finding in findings if finding["name"] == "poc" and finding["status"] == "observed"), None)
-    if poc:
+def compute_exploitability(findings: List[Dict[str, Any]], proofs: List[Dict[str, Any]]) -> str:
+    if any(proof.get("verified") for proof in proofs):
         return "EXPLOITABLE_CONFIRMED"
     sink = next(
         (finding for finding in findings if finding["name"] == "sink_indicators" and finding["status"] == "observed"),
@@ -113,10 +131,28 @@ def compute_exploitability(findings: List[Dict[str, Any]]) -> str:
         details = gadget.get("details") or {}
         matches = details.get("matches", [])
         if any(match.endswith(":HIGH") for match in matches):
-            return "LIKELY"
+            return "LIKELY_EXPLOITABLE"
     if any(finding["status"] == "observed" for finding in findings):
         return "INCONCLUSIVE"
     return "NOT_OBSERVED"
+
+
+def parse_bool(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "y"}
+
+
+def render_file_path(template: str) -> str:
+    date = time.strftime("%Y-%m-%d")
+    return template.replace("<DATE>", date).replace("<YYYY-MM-DD>", date)
+
+
+def run_runner(plugin, ctx: Dict[str, Any], target: Dict[str, Any], payload_spec: Dict[str, Any]) -> Dict[str, Any]:
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(plugin.run(ctx, target, payload_spec))
+    finally:
+        loop.close()
+    return result
 
 
 def main() -> None:
@@ -131,9 +167,18 @@ def main() -> None:
     parser.add_argument("--jmx-user", default=None)
     parser.add_argument("--jmx-pass", default=None)
     parser.add_argument("--i-accept-risk", action="store_true")
-    parser.add_argument("--poc-plugin", action="append", default=[])
-    parser.add_argument("--callback-listen", default=None, help="host:port to bind callback listener")
-    parser.add_argument("--callback-url", default=None, help="External callback base URL")
+    parser.add_argument("--poc-runner", action="append", default=[])
+    parser.add_argument("--poc-proof", choices=["filewrite", "cmd", "both"], default="filewrite")
+    parser.add_argument("--poc-file-path", default=DEFAULT_POC_FILE_PATH)
+    parser.add_argument("--poc-file-template", default=DEFAULT_POC_FILE_TEMPLATE)
+    parser.add_argument("--poc-cleanup", type=str, default="false")
+    parser.add_argument("--verifier", choices=["auto", "callback_http", "smb_share", "winrm"], default="auto")
+    parser.add_argument("--callback-bind", default=None)
+    parser.add_argument("--callback-port", type=int, default=None)
+    parser.add_argument("--callback-url", default=None)
+    parser.add_argument("--smb-share-path", default=None)
+    parser.add_argument("--smb-share-subdir", default=None)
+    parser.add_argument("--callback-timeout", type=float, default=5.0)
     args = parser.parse_args()
 
     if args.mode == "poc" and not args.i_accept_risk:
@@ -163,19 +208,21 @@ def main() -> None:
     callback_server: Optional[CallbackServer] = None
     callback_base: Optional[str] = None
 
-    if args.callback_listen:
-        host, port = args.callback_listen.split(":")
-        callback_server = CallbackServer(host, int(port))
+    if args.callback_url:
+        callback_base = args.callback_url.rstrip("/")
+    elif args.callback_bind and args.callback_port:
+        callback_server = CallbackServer(args.callback_bind, args.callback_port)
         callback_server.start()
         callback_base = callback_server.address
-    elif args.callback_url:
-        callback_base = args.callback_url.rstrip("/")
+
+    smb_share_path = Path(args.smb_share_path) if args.smb_share_path else None
 
     results: List[Dict[str, Any]] = []
 
     def process_endpoint(endpoint: Endpoint) -> Dict[str, Any]:
         enum_data = {}
         findings: List[Dict[str, Any]] = []
+        proofs: List[Dict[str, Any]] = []
         text_sources: List[str] = []
         port_info = host_ports.get((endpoint.host, endpoint.port))
         if port_info:
@@ -195,38 +242,88 @@ def main() -> None:
                     "details": finding.details,
                 })
         if args.mode == "poc":
-            for plugin_path in args.poc_plugin:
-                plugin = load_poc_plugin(Path(plugin_path))
+            runner_results = []
+            for runner_path in args.poc_runner:
+                runner = load_runner(Path(runner_path))
                 token = uuid.uuid4().hex
-                callback_url = None
-                if callback_base:
-                    callback_url = f"{callback_base}/?token={token}"
-                context = {
-                    "endpoint": {
-                        "host": endpoint.host,
-                        "port": endpoint.port,
-                        "kind": endpoint.kind,
-                    },
+                callback_url = f"{callback_base}/?token={token}" if callback_base else None
+                ctx = {
+                    "run_id": run_id,
                     "callback_url": callback_url,
+                    "verifier": args.verifier,
                 }
-                plugin(context)
-                if callback_server and callback_url:
-                    check_dir = evidence_dir / endpoint.endpoint_id
-                    if callback_server.registry.get(token):
-                        ref = write_evidence_json(
-                            check_dir,
-                            f"poc-callback-{token}.json",
-                            {"token": token, "path": callback_url},
+                target = {"host": endpoint.host, "port": endpoint.port, "kind": endpoint.kind}
+                payload_spec = {
+                    "proof": args.poc_proof,
+                    "file_path": render_file_path(args.poc_file_path),
+                    "file_template": args.poc_file_template,
+                }
+                raw_result = run_runner(runner, ctx, target, payload_spec)
+                result = coerce_runner_result(raw_result)
+                runner_evidence = write_evidence_json(
+                    evidence_dir / endpoint.endpoint_id,
+                    f"runner-{runner.runner_id}.json",
+                    {
+                        "runner_id": runner.runner_id,
+                        "title": runner.title,
+                        "success": result.success,
+                        "notes": result.notes,
+                        "evidence_refs": result.evidence_refs,
+                    },
+                )
+                runner_results.append({
+                    "runner_id": runner.runner_id,
+                    "title": runner.title,
+                    "success": result.success,
+                    "evidence": [runner_evidence],
+                })
+
+                verifier_ctx = VerifierContext(
+                    evidence_dir=evidence_dir / endpoint.endpoint_id,
+                    verifier=args.verifier,
+                    callback_registry=callback_server.registry if callback_server else None,
+                    callback_timeout=args.callback_timeout,
+                    smb_share_path=smb_share_path,
+                    smb_share_subdir=args.smb_share_subdir,
+                )
+                proofs_to_run = [args.poc_proof] if args.poc_proof != "both" else ["filewrite", "cmd"]
+                for proof_type in proofs_to_run:
+                    if proof_type == "filewrite":
+                        proof_path = render_file_path(args.poc_file_path)
+                        verify_result = verify_file_write(
+                            verifier_ctx,
+                            result.execution_channel,
+                            proof_path,
+                            args.poc_file_template,
+                            parse_bool(args.poc_cleanup),
                         )
-                        findings.append({
-                            "name": "poc",
-                            "status": "observed",
-                            "evidence": [ref],
-                            "details": None,
+                        proofs.append({
+                            "type": "FileWrite",
+                            "path": proof_path,
+                            "verified": verify_result.verified,
+                            "artifacts": verify_result.artifacts,
+                            "evidence": verify_result.evidence_refs,
+                            "summary": "file-write proof" if verify_result.verified else "not verified",
                         })
-            if args.poc_plugin and not any(f["name"] == "poc" for f in findings):
-                findings.append({"name": "poc", "status": "not_observed", "evidence": [], "details": None})
-        exploitability = compute_exploitability(findings) if findings else "INCONCLUSIVE"
+                    elif proof_type == "cmd":
+                        verify_result = verify_cmd(
+                            verifier_ctx,
+                            result.execution_channel,
+                            "whoami/hostname",
+                        )
+                        proofs.append({
+                            "type": "CommandOutput",
+                            "path": None,
+                            "verified": verify_result.verified,
+                            "artifacts": verify_result.artifacts,
+                            "evidence": verify_result.evidence_refs,
+                            "summary": "command output proof" if verify_result.verified else "not verified",
+                        })
+            poc_payload = {"proofs": proofs, "runners": runner_results}
+        else:
+            poc_payload = {}
+
+        exploitability = compute_exploitability(findings, proofs) if args.mode == "poc" else compute_exploitability(findings, [])
         return {
             "endpoint_id": endpoint.endpoint_id,
             "host": endpoint.host,
@@ -234,6 +331,7 @@ def main() -> None:
             "kind": endpoint.kind,
             "enum": enum_data,
             "findings": findings,
+            "poc": poc_payload,
             "exploitability": exploitability,
         }
 

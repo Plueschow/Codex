@@ -8,8 +8,8 @@
 - **Derived-Endpoint-Graph**: BFS bis `--max-depth`, Dedupe, Evidence-Referenzen.
 - **Enumeration (read-only)** für RMI-Registry und JMX (stubs, nicht destruktiv).
 - **Verification-Checks (Plugins)**: `auth_required`, `tls_required`, `error_oracle`, `sink_indicators`, `gadget_detect` mit Evidence + SHA256-Referenzen.
-- **PoC-Mode nur mit Risiko-Akzeptanz** (`--i-accept-risk`) und **nur user-supplied PoC-Plugins**.
-- **Callback-Canary**: lokaler HTTP-Listener oder externer Callback-URL, Evidence-Korrelation.
+- **PoC-Mode mit Windows-RCE-Proof**: ExploitRunner + Verifier, keine eingebauten Exploit-Chains.
+- **Verifier Backends**: `callback_http` (default), `smb_share`, optional `winrm`.
 - **Stabile Outputs**: `results.json`, optional `results.ndjson`, `findings.md`, `graph.json`, `meta.json`, `evidence/`.
 
 ## Installation
@@ -28,7 +28,13 @@ rjscan --nmap-xml scan.xml
 - `enum` (Default): Enumeration + Ausgabe der Ergebnisse.
 - `verify`: Nicht-destruktive Prüfungen mit Evidence-Ausgaben.
 - `assess`: Kombination aus Enum + Verify.
-- `poc`: Nur mit `--i-accept-risk`. Führt ausschließlich **user-supplied** PoC-Plugins aus.
+- `poc`: Nur mit `--i-accept-risk`. Führt ausschließlich **user-supplied** ExploitRunner aus.
+
+## PoC-Architektur (Windows RCE Proof)
+`rjscan` trennt strikt zwischen ExploitRunner (user-supplied) und Verifier (built-in). Ein Endpoint wird **nur** `EXPLOITABLE_CONFIRMED`, wenn der Verifier einen gültigen Windows-RCE-Proof bestätigt:
+
+- **File-Write Proof (Preferred)**: Datei `C:\Pentest_RMI_<YYYY-MM-DD>.txt` mit Timestamp, `whoami`, `hostname`.
+- **Command Output Proof**: `whoami` oder `hostname` Output kommt zurück.
 
 ## Beispiele
 ### Verify-Mode
@@ -39,20 +45,33 @@ rjscan --nmap-xml scan.xml --mode verify --max-depth 2 --ndjson
 ### PoC-Mode (nur mit Risiko-Akzeptanz)
 ```bash
 rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
-  --poc-plugin ./poc_example.py --callback-listen 127.0.0.1:8081
+  --poc-runner ./poc_runners/custom_runner.py \
+  --poc-proof filewrite \
+  --callback-bind 127.0.0.1 --callback-port 8081
 ```
 
-### Externer Callback
+### SMB Verifier
 ```bash
 rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
-  --poc-plugin ./poc_example.py --callback-url https://example.net/callback
+  --poc-runner ./poc_runners/custom_runner.py \
+  --verifier smb_share --smb-share-path /mnt/share --smb-share-subdir rjscan
 ```
+
+## CLI Flags (PoC/Verifier)
+- `--poc-runner <file.py>` (repeatable)
+- `--poc-proof filewrite|cmd|both` (default: `filewrite`)
+- `--poc-file-path "C:\\Pentest_RMI_<DATE>.txt"`
+- `--poc-file-template "Timestamp: ..."`
+- `--poc-cleanup true|false` (default: false)
+- `--verifier auto|callback_http|smb_share|winrm` (default: auto)
+- Callback: `--callback-bind <host> --callback-port <port>` oder `--callback-url <url>`
+- SMB: `--smb-share-path <path> --smb-share-subdir <subdir>`
 
 ## Outputs
 Jeder Lauf erzeugt ein Verzeichnis `rjscan-run-<timestamp>-<id>/`:
 - `results.json`: Vollständige Ergebnisse pro Endpoint.
 - `results.ndjson`: Optional (Zeile pro Endpoint).
-- `findings.md`: Menschlich lesbare Zusammenfassung.
+- `findings.md`: Menschlich lesbare Zusammenfassung inkl. PoC Proof.
 - `graph.json`: Endpoint-Graph mit Evidence-Referenzen.
 - `meta.json`: Lauf-Metadaten.
 - `evidence/`: Evidence-Dateien mit SHA256-Referenzen.
@@ -63,17 +82,27 @@ Jeder Lauf erzeugt ein Verzeichnis `rjscan-run-<timestamp>-<id>/`:
 - **Keine Ausgabe von Credentials** (Nutzername/Passwort werden nicht geloggt).
 - **Nicht destruktiv** in `enum`/`verify`/`assess`.
 
-## PoC-Plugin-Schnittstelle
-PoC-Plugins müssen eine Funktion `run(context)` bereitstellen und dürfen nur **benigne** Callbacks erzeugen.
+## ExploitRunner Plugin-Schnittstelle
+ExploitRunner müssen `RUNNER_ID`, `TITLE` und eine `async def run(ctx, target, payload_spec)` Funktion bereitstellen.
 
 ```python
-# poc_example.py
+# poc_runners/custom_runner.py
+RUNNER_ID = "custom"
+TITLE = "Custom Runner"
 
-def run(context):
-    endpoint = context["endpoint"]
-    callback_url = context.get("callback_url")
-    # ... user-defined PoC logic ...
-    return {"status": "ok", "endpoint": endpoint, "callback": callback_url}
+async def run(ctx, target, payload_spec):
+    # ctx enthält callback_url, verifier, run_id
+    # target enthält host, port, kind
+    # payload_spec enthält proof, file_path, file_template
+    return {
+        "success": True,
+        "execution_channel": {
+            "callback_token": "token123",
+            "cmd_output": {"whoami": "lab\\user", "hostname": "WINHOST"},
+        },
+        "evidence_refs": [],
+        "notes": [],
+    }
 ```
 
 ## Tests
