@@ -8,6 +8,7 @@
 - **Derived-Endpoint-Graph**: BFS bis `--max-depth`, Dedupe, Evidence-Referenzen.
 - **Enumeration (read-only)** für RMI-Registry und JMX (stubs, nicht destruktiv).
 - **Verification-Checks (Plugins)**: `auth_required`, `tls_required`, `error_oracle`, `sink_indicators`, `gadget_detect` mit Evidence + SHA256-Referenzen.
+- **Gadget & Chain Detection** über KB-Dateien (`kb/gadgets.yml`, `kb/chains.yml`).
 - **PoC-Mode mit Windows-RCE-Proof**: ExploitRunner + Verifier, keine eingebauten Exploit-Chains.
 - **Verifier Backends**: `callback_http` (default), `smb_share`, optional `winrm`.
 - **Stabile Outputs**: `results.json`, optional `results.ndjson`, `findings.md`, `graph.json`, `meta.json`, `evidence/`.
@@ -45,7 +46,7 @@ rjscan --nmap-xml scan.xml --mode verify --max-depth 2 --ndjson
 ### PoC-Mode (nur mit Risiko-Akzeptanz)
 ```bash
 rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
-  --poc-runner ./poc_runners/custom_runner.py \
+  --poc-runner ./poc_runners/http_callback_runner.py \
   --poc-proof filewrite \
   --callback-bind 127.0.0.1 --callback-port 8081
 ```
@@ -53,7 +54,7 @@ rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
 ### SMB Verifier
 ```bash
 rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
-  --poc-runner ./poc_runners/custom_runner.py \
+  --poc-runner ./poc_runners/http_callback_runner.py \
   --verifier smb_share --smb-share-path /mnt/share --smb-share-subdir rjscan
 ```
 
@@ -66,6 +67,40 @@ rjscan --nmap-xml scan.xml --mode poc --i-accept-risk \
 - `--verifier auto|callback_http|smb_share|winrm` (default: auto)
 - Callback: `--callback-bind <host> --callback-port <port>` oder `--callback-url <url>`
 - SMB: `--smb-share-path <path> --smb-share-subdir <subdir>`
+
+## Gadget & Chain Matching
+- Gadgets werden über `kb/gadgets.yml` anhand von Indikatoren erkannt.
+- Chains werden in `kb/chains.yml` als Kombination aus Gadget-Namen definiert.
+- Die Treffer erscheinen in `gadget_detect` Details als `matches` und `chains`.
+
+## ExploitRunner Plugin-Schnittstelle
+ExploitRunner müssen `RUNNER_ID`, `TITLE` und eine `async def run(ctx, target, payload_spec)` Funktion bereitstellen.
+
+```python
+# poc_runners/custom_runner.py
+RUNNER_ID = "custom"
+TITLE = "Custom Runner"
+
+async def run(ctx, target, payload_spec):
+    # ctx enthält callback_url, callback_token, verifier, run_id
+    # target enthält host, port, kind
+    # payload_spec enthält proof, file_path, file_template
+    return {
+        "success": True,
+        "execution_channel": {
+            "callback_token": "token123",
+            "cmd_output": {"whoami": "lab\\user", "hostname": "WINHOST"},
+        },
+        "evidence_refs": [],
+        "notes": [],
+    }
+```
+
+### Beispiel-Runner (Wrapper)
+Der mitgelieferte `poc_runners/http_callback_runner.py` ist ein **Wrapper**, der externe Tools aufruft. Er enthält **keine** Exploit-Chain. Konfiguration:
+
+- `RJSCAN_RUNNER_CMD`: Kommando-Template, z. B. `tool --target {HOST}:{PORT} --callback {CALLBACK_URL}`
+- `RJSCAN_RUNNER_RESULT`: Optionaler Pfad zu einer JSON-Datei, die der externe Runner schreibt.
 
 ## Outputs
 Jeder Lauf erzeugt ein Verzeichnis `rjscan-run-<timestamp>-<id>/`:
@@ -81,29 +116,6 @@ Jeder Lauf erzeugt ein Verzeichnis `rjscan-run-<timestamp>-<id>/`:
 - **PoC-Ausführung nur mit `--i-accept-risk`**.
 - **Keine Ausgabe von Credentials** (Nutzername/Passwort werden nicht geloggt).
 - **Nicht destruktiv** in `enum`/`verify`/`assess`.
-
-## ExploitRunner Plugin-Schnittstelle
-ExploitRunner müssen `RUNNER_ID`, `TITLE` und eine `async def run(ctx, target, payload_spec)` Funktion bereitstellen.
-
-```python
-# poc_runners/custom_runner.py
-RUNNER_ID = "custom"
-TITLE = "Custom Runner"
-
-async def run(ctx, target, payload_spec):
-    # ctx enthält callback_url, verifier, run_id
-    # target enthält host, port, kind
-    # payload_spec enthält proof, file_path, file_template
-    return {
-        "success": True,
-        "execution_channel": {
-            "callback_token": "token123",
-            "cmd_output": {"whoami": "lab\\user", "hostname": "WINHOST"},
-        },
-        "evidence_refs": [],
-        "notes": [],
-    }
-```
 
 ## Tests
 ```bash

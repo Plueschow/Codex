@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from rjscan.evidence import write_evidence_text
-from rjscan.kb import GadgetSignature, match_gadgets
+from rjscan.kb import ChainSignature, GadgetSignature, match_chains, match_gadgets
 
 
 @dataclass
@@ -56,11 +56,20 @@ def check_sink_indicators(text: str, evidence_dir: Path) -> VerifyFinding:
     return VerifyFinding(name="sink_indicators", status=status, evidence=evidence)
 
 
-def check_gadget_detect(text: str, evidence_dir: Path, gadgets: List[GadgetSignature]) -> VerifyFinding:
+def check_gadget_detect(
+    text: str,
+    evidence_dir: Path,
+    gadgets: List[GadgetSignature],
+    chains: List[ChainSignature],
+) -> VerifyFinding:
     matches = match_gadgets(text, gadgets)
+    chain_matches = match_chains(matches, chains)
     if matches:
         content = "\n".join(f"{match.name}:{match.confidence}" for match in matches)
-        details = {"matches": [f"{match.name}:{match.confidence}" for match in matches]}
+        details = {
+            "matches": [f"{match.name}:{match.confidence}" for match in matches],
+            "chains": [f"{chain.name}:{chain.confidence}" for chain in chain_matches],
+        }
     else:
         content = ""
         details = None
@@ -69,11 +78,16 @@ def check_gadget_detect(text: str, evidence_dir: Path, gadgets: List[GadgetSigna
     return VerifyFinding(name="gadget_detect", status=status, evidence=evidence, details=details)
 
 
-def run_checks(text: str, evidence_dir: Path, gadgets: List[GadgetSignature]) -> List[VerifyFinding]:
+def run_checks(
+    text: str,
+    evidence_dir: Path,
+    gadgets: List[GadgetSignature],
+    chains: List[ChainSignature],
+) -> List[VerifyFinding]:
     return [
         check_auth_required(text, evidence_dir),
         check_tls_required(text, evidence_dir),
         check_error_oracle(text, evidence_dir),
         check_sink_indicators(text, evidence_dir),
-        check_gadget_detect(text, evidence_dir, gadgets),
+        check_gadget_detect(text, evidence_dir, gadgets, chains),
     ]

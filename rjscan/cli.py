@@ -14,7 +14,7 @@ from rjscan.callback import CallbackServer
 from rjscan.evidence import write_evidence_json, write_evidence_text
 from rjscan.enumerate import enumerate_jmx, enumerate_rmi_registry
 from rjscan.graph import Endpoint, bfs_graph, extract_hints
-from rjscan.kb import load_gadgets
+from rjscan.kb import load_chains, load_gadgets
 from rjscan.nmap_parser import parse_nmap_xml, PortInfo
 from rjscan.poc.verifier_windows import VerifierContext, verify_cmd, verify_file_write
 from rjscan.poc_runner import coerce_runner_result, load_runner
@@ -204,6 +204,7 @@ def main() -> None:
     endpoints, edges = bfs_graph(endpoints, hint_provider, args.max_depth)
 
     gadgets = load_gadgets(Path(__file__).resolve().parent.parent / "kb" / "gadgets.yml")
+    chains = load_chains(Path(__file__).resolve().parent.parent / "kb" / "chains.yml")
 
     callback_server: Optional[CallbackServer] = None
     callback_base: Optional[str] = None
@@ -234,7 +235,7 @@ def main() -> None:
         combined_text = "\n".join(text_sources)
         if args.mode in {"verify", "assess", "poc"}:
             check_dir = evidence_dir / endpoint.endpoint_id
-            for finding in run_checks(combined_text, check_dir, gadgets):
+            for finding in run_checks(combined_text, check_dir, gadgets, chains):
                 findings.append({
                     "name": finding.name,
                     "status": finding.status,
@@ -250,6 +251,7 @@ def main() -> None:
                 ctx = {
                     "run_id": run_id,
                     "callback_url": callback_url,
+                    "callback_token": token,
                     "verifier": args.verifier,
                 }
                 target = {"host": endpoint.host, "port": endpoint.port, "kind": endpoint.kind}

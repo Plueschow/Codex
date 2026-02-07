@@ -1,0 +1,9 @@
+chains:
+  - name: CommonsCollections-RCE
+    confidence: HIGH
+    requires:
+      - CommonsCollections1
+  - name: Spring-Core-Chain
+    confidence: MEDIUM
+    requires:
+      - SpringCore
