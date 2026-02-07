@@ -1,0 +1,11 @@
+gadgets:
+  - name: CommonsCollections1
+    confidence: HIGH
+    indicators:
+      - org.apache.commons.collections
+      - InvokerTransformer
+  - name: SpringCore
+    confidence: MEDIUM
+    indicators:
+      - org.springframework
+      - SerializableTypeWrapper

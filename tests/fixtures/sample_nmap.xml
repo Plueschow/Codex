@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="192.168.1.10" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="1099">
+        <service name="rmiregistry" product="Java RMI" version="1.0" extrainfo="RMI registry"/>
+        <script id="rmi-dumpregistry" output="registry at 192.168.1.10:1099"/>
+      </port>
+      <port protocol="tcp" portid="9999">
+        <service name="jmx" product="JMX" version="1.2"/>
+        <script id="jmx-info" output="JMX remote at 192.168.1.11:9999"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
